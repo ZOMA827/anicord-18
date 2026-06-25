@@ -174,7 +174,7 @@ app.post('/api/upload', upload.single('video'), async (req, res) => {
 // -------------------------------------------------------------
 // 🔥 دوال محرك البث التدفقي والـ Cache الذكي (النسخة المضادة للقنابل)
 // -------------------------------------------------------------
-const CHUNK_SIZE = 128 * 1024; 
+const CHUNK_SIZE = 512 * 1024; 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // 💡 خريطة تخزين الوعود لمنع تكرار التحميل لنفس القطعة (Promise Deduplication)
