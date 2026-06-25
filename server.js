@@ -16,12 +16,14 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// مجلد الميديا الافتراضي ومجلد الكاش الذكي
 const uploadDir = './uploads';
 const cacheDir = path.join(uploadDir, 'cache');
 
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 if (!fs.existsSync(cacheDir)) fs.mkdirSync(cacheDir, { recursive: true });
 
+// إعداد كائن تخزين multer لحفظ الملفات المرفوعة مؤقتاً باسمائها الأصلية
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, uploadDir);
@@ -33,7 +35,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage: storage,
-  limits: { fileSize: 2 * 1024 * 1024 * 1024 },
+  limits: { fileSize: 2 * 1024 * 1024 * 1024 }, // حد أقصى 2 جيجابايت
 });
 
 app.use(cors());
@@ -72,6 +74,7 @@ async function getClient() {
     onError: (err) => console.error('❌ خطأ أثناء الاتصال:', err.message),
   });
   
+  // حفظ الجلسة إذا كانت جديدة
   const newSessionString = client.session.save();
   await fs.promises.writeFile(sessionFile, newSessionString, 'utf8');
   
@@ -98,7 +101,7 @@ async function getStreamClient() {
 }
 
 // -------------------------------------------------------------
-// 🚀 مسار الرفع المطور (تمت إضافة messageId و channel)
+// 🚀 مسار الرفع المطور
 // -------------------------------------------------------------
 app.post('/api/upload', upload.single('video'), async (req, res) => {
   const file = req.file;
@@ -112,6 +115,7 @@ app.post('/api/upload', upload.single('video'), async (req, res) => {
     const clientInstance = await getClient();
     const destination = channelId || 'me';
 
+    // استخدام Buffer لتفادي مشكلة مسارات الويندوز
     const fileBuffer = await fs.promises.readFile(file.path);
 
     const uploadResult = await clientInstance.sendFile(destination, {
@@ -128,7 +132,6 @@ app.post('/api/upload', upload.single('video'), async (req, res) => {
     let accessHash = '0';
     let fileRefHex = '0';
     let fileSize = '0';
-    let messageId = uploadResult.id || 0; // ✅ حفظ الـ messageId
 
     if (uploadResult?.media?.document) {
       fileId = uploadResult.media.document.id.toString();
@@ -142,13 +145,15 @@ app.post('/api/upload', upload.single('video'), async (req, res) => {
       fileSize = uploadResult.media.video.size.toString();
     }
 
-    if (!fileId) throw new Error('فشل استخراج بيانات الملف من رد تليغرام');
+    if (!fileId) {
+      throw new Error('فشل استخراج بيانات الملف من رد تليغرام');
+    }
 
+    // تنظيف الملف المؤقت باستخدام النسخة غير الحاصرة
     fs.promises.unlink(file.path).catch(err => console.warn('⚠️ تنبيه: فشل حذف الملف المؤقت:', err));
 
-    // ✅ دمج المعرفات الجديدة لتشمل رسالة المصدر
-    const combinedId = `${fileId}_${accessHash}_${fileRefHex}_${fileSize}_${messageId}_${destination}`;
-    console.log(`✅ اكتمل الرفع بنجاح!`);
+    const combinedId = `${fileId}_${accessHash}_${fileRefHex}_${fileSize}`;
+    console.log(`✅ اكتمل الرفع بنجاح! الـ file_id المدمج: ${combinedId}`);
     
     res.json({
       success: true,
@@ -167,20 +172,22 @@ app.post('/api/upload', upload.single('video'), async (req, res) => {
 });
 
 // -------------------------------------------------------------
-// 🔥 دوال محرك البث التدفقي (تمت زيادة الـ Chunk Size وحل Expired)
+// 🔥 دوال محرك البث التدفقي والـ Cache الذكي (النسخة المضادة للقنابل)
 // -------------------------------------------------------------
-const CHUNK_SIZE = 512 * 1024; // ✅ تمت زيادته إلى 512KB لتقليل Overhead الطلبات
+const CHUNK_SIZE = 128 * 1024; 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// 💡 خريطة تخزين الوعود لمنع تكرار التحميل لنفس القطعة (Promise Deduplication)
 const activeDownloads = new Map();
 
-// ✅ تم تمرير messageId و channel لاستخدامهما في حال انتهاء الصلاحية
-async function fetchChunkWithCache(fileId, accessHash, fileRefHex, chunkIndex, totalSize, messageId, channel) {
+async function fetchChunkWithCache(fileId, accessHash, fileRefHex, chunkIndex, totalSize) {
+  // 💡 إنشاء مجلد خاص لكل حلقة لتفادي انفجار عدد الملفات في مجلد واحد
   const episodeCacheDir = path.join(cacheDir, fileId);
   await fs.promises.mkdir(episodeCacheDir, { recursive: true });
   
   const cachePath = path.join(episodeCacheDir, `chunk_${chunkIndex}.dat`);
 
+  // 💡 القراءة غير الحاصرة (Async) لحماية Event Loop
   if (fs.existsSync(cachePath)) {
     return await fs.promises.readFile(cachePath);
   }
@@ -190,61 +197,32 @@ async function fetchChunkWithCache(fileId, accessHash, fileRefHex, chunkIndex, t
 
   const taskKey = `${fileId}_${chunkIndex}`;
 
+  // 💡 نظام دمج الطلبات: إذا كانت القطعة قيد التحميل مسبقاً، انتظر النتيجة بدلاً من طلبها مجدداً
   if (activeDownloads.has(taskKey)) {
     return await activeDownloads.get(taskKey);
   }
 
+  // إذا لم تكن قيد التحميل، ابدأ التحميل واحفظ الوعد (Promise)
   const downloadPromise = (async () => {
-    let currentFileRefHex = fileRefHex;
     let tgLimit = CHUNK_SIZE;
-    let retries = 2; // محاولات في حال انتهاء الـ FileReference
+    const tgStreamClient = await getStreamClient();
+    const fileResult = await tgStreamClient.invoke(
+      new Api.upload.GetFile({
+        location: new Api.InputDocumentFileLocation({
+          id: BigInt(fileId),
+          accessHash: BigInt(accessHash),
+          fileReference: fileRefHex !== '0' ? Buffer.from(fileRefHex, 'hex') : Buffer.alloc(0),
+          thumbSize: ""
+        }),
+        offset: BigInt(tgOffset),
+        limit: tgLimit
+      })
+    );
 
-    while (retries > 0) {
-      try {
-        const tgStreamClient = await getStreamClient();
-        const fileResult = await tgStreamClient.invoke(
-          new Api.upload.GetFile({
-            location: new Api.InputDocumentFileLocation({
-              id: BigInt(fileId),
-              accessHash: BigInt(accessHash),
-              fileReference: currentFileRefHex !== '0' ? Buffer.from(currentFileRefHex, 'hex') : Buffer.alloc(0),
-              thumbSize: ""
-            }),
-            offset: BigInt(tgOffset),
-            limit: tgLimit
-          })
-        );
-
-        if (fileResult && fileResult.bytes && fileResult.bytes.length > 0) {
-          await fs.promises.writeFile(cachePath, fileResult.bytes);
-          return fileResult.bytes;
-        }
-        return Buffer.alloc(0);
-
-      } catch (err) {
-        // ✅ الكشف عن انتهاء صلاحية FileReference وتجديده تلقائياً
-        if (err.message.includes('FILE_REFERENCE_EXPIRED') && messageId && channel) {
-          console.log(`🔄 الـ FileReference انتهت صلاحيته! جاري تجديده من الرسالة ${messageId}...`);
-          try {
-            const mainClient = await getClient();
-            const peer = isNaN(channel) ? channel : BigInt(channel);
-            const messages = await mainClient.getMessages(peer, { ids: [parseInt(messageId)] });
-            
-            if (messages && messages.length > 0 && messages[0].media) {
-              const media = messages[0].media.document || messages[0].media.video;
-              if (media && media.fileReference) {
-                currentFileRefHex = media.fileReference.toString('hex');
-                console.log(`✅ تم جلب FileReference جديد بنجاح! إعادة المحاولة...`);
-                retries--;
-                continue; // إعادة المحاولة بالكود الجديد
-              }
-            }
-          } catch (refreshErr) {
-            console.error(`❌ فشل في تجديد الـ FileReference:`, refreshErr.message);
-          }
-        }
-        throw err; // إذا لم يكن الخطأ Expired أو فشل التجديد، ارمِ الخطأ
-      }
+    if (fileResult && fileResult.bytes && fileResult.bytes.length > 0) {
+      // 💡 الكتابة غير الحاصرة لحماية السيرفر
+      await fs.promises.writeFile(cachePath, fileResult.bytes);
+      return fileResult.bytes;
     }
     return Buffer.alloc(0);
   })();
@@ -254,12 +232,14 @@ async function fetchChunkWithCache(fileId, accessHash, fileRefHex, chunkIndex, t
   try {
     return await downloadPromise;
   } finally {
+    // 💡 تنظيف الخريطة فور انتهاء التحميل
     activeDownloads.delete(taskKey);
   }
 }
 
+// 💡 إدارة الجلب المسبق بهدوء لمنع اختناق الشبكة
 const activePrefetches = new Set();
-async function prefetchNextChunks(fileId, accessHash, fileRefHex, currentChunkIndex, totalSize, messageId, channel) {
+async function prefetchNextChunks(fileId, accessHash, fileRefHex, currentChunkIndex, totalSize) {
   const PREFETCH_COUNT = 2; 
   await delay(200);
 
@@ -278,7 +258,7 @@ async function prefetchNextChunks(fileId, accessHash, fileRefHex, currentChunkIn
 
     try {
       activePrefetches.add(taskKey);
-      await fetchChunkWithCache(fileId, accessHash, fileRefHex, nextIndex, totalSize, messageId, channel);
+      await fetchChunkWithCache(fileId, accessHash, fileRefHex, nextIndex, totalSize);
       console.log(`⚡ [Prefetch الهادئ] تم تجهيز الكتلة [${nextIndex}] بنجاح.`);
       await delay(300); 
     } catch (err) {
@@ -303,13 +283,10 @@ app.get('/api/video/stream/:combinedId', async (req, res) => {
     const parts = combinedId.split('_');
     if (parts.length < 2) return res.status(400).json({ error: 'معرف غير صالح' });
 
-    // ✅ فك تشفير البيانات الجديدة
     const fileId = parts[0];
     const accessHash = parts[1];
     const fileRefHex = parts[2] && parts[2] !== 'undefined' ? parts[2] : '0';
     const totalSize = parts[3] ? parseInt(parts[3], 10) : 0; 
-    const messageId = parts[4] ? parseInt(parts[4], 10) : null;
-    const channel = parts[5] || 'me';
 
     const rangeHeader = req.headers.range;
     let startByte = 0;
@@ -327,7 +304,7 @@ app.get('/api/video/stream/:combinedId', async (req, res) => {
     const chunkStartByte = currentChunkIndex * CHUNK_SIZE;
     const extraBytes = startByte - chunkStartByte;
 
-    const chunkBuffer = await fetchChunkWithCache(fileId, accessHash, fileRefHex, currentChunkIndex, totalSize, messageId, channel);
+    const chunkBuffer = await fetchChunkWithCache(fileId, accessHash, fileRefHex, currentChunkIndex, totalSize);
 
     if (!chunkBuffer || chunkBuffer.length === 0) {
       return res.status(404).end();
@@ -348,9 +325,7 @@ app.get('/api/video/stream/:combinedId', async (req, res) => {
 
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Accept-Ranges', 'bytes');
-    
-    // ✅ الإصلاح الكبير: تفعيل كاش المتصفح لمدة يوم كامل بدلاً من منعه
-    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
 
     if (totalSize) {
       res.setHeader('Content-Length', availableLength.toString());
@@ -366,21 +341,13 @@ app.get('/api/video/stream/:combinedId', async (req, res) => {
     res.write(cleanBuffer);
     res.end();
 
-    prefetchNextChunks(fileId, accessHash, fileRefHex, currentChunkIndex, totalSize, messageId, channel);
+    prefetchNextChunks(fileId, accessHash, fileRefHex, currentChunkIndex, totalSize);
 
   } catch (error) {
     console.error(`[${requestId}] ❌ خطأ في محرك البث المطور:`, error.message);
     if (!res.headersSent) res.status(500).json({ error: 'خطأ داخلي في السيرفر' });
   }
 });
-
-// -------------------------------------------------------------
-// 📊 نظام مراقبة استهلاك موارد السيرفر
-// -------------------------------------------------------------
-setInterval(() => {
-  const mem = process.memoryUsage();
-  console.log(`[📊 وضع السيرفر] الرام: ${(mem.rss / 1024 / 1024).toFixed(2)} MB | الذاكرة الداخلية: ${(mem.heapUsed / 1024 / 1024).toFixed(2)} MB | الطلبات المعلقة: ${activeDownloads.size}`);
-}, 10000); 
 
 // -------------------------------------------------------------
 // تهيئة السيرفر والإقلاع
